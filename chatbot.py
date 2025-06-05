@@ -21,6 +21,7 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import numpy as np
 import streamlit.web.cli as stcli
+import torch  # Explicitly import torch for device control
 
 # Ensure deterministic language detection
 DetectorFactory.seed = 0
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # Initialize Gemini client
 try:
-    genai.configure(api_key="AIzaSyDSdx_r2bsGNxDydqUAxXDeyL795YONMnc")  # Use .env file for API key
+    genai.configure(api_key="AIzaSyDSdx_r2bsGNxDydqUAxXDeyL795YONMnc")  # Use .env for API key
     model = genai.GenerativeModel("gemma-3n-e4b-it")
 except Exception as e:
     st.error(f"Failed to initialize Gemini: {e}")
@@ -43,11 +44,14 @@ except Exception as e:
 
 # Initialize vector store
 try:
-    embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={'device': 'cpu'}  # Explicitly set device to CPU
+    )
     vectorstore = Chroma(
         collection_name="lstm_rag",
         embedding_function=embedding_model,
-        persist_directory="./chroma_db"
+        persist_directory="/tmp/chroma_db"  # Use /tmp for Streamlit Cloud
     )
 except Exception as e:
     st.error(f"Failed to initialize vector store: {e}")
@@ -55,12 +59,12 @@ except Exception as e:
     st.stop()
 
 # Initialize sentence transformer
-intent_embedder = SentenceTransformer('all-MiniLM-L6-v2')
+intent_embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')  # Explicitly set device to CPU
 
 # SQLite for chat history
 def init_db():
     try:
-        conn = sqlite3.connect('chat_history.db')
+        conn = sqlite3.connect('/tmp/chat_history.db')  # Use /tmp for Streamlit Cloud
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS chats
                      (id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,7 +82,7 @@ def init_db():
 
 def save_message(session_id, role, content, images, language):
     try:
-        conn = sqlite3.connect('chat_history.db')
+        conn = sqlite3.connect('/tmp/chat_history.db')  # Use /tmp for Streamlit Cloud
         c = conn.cursor()
         images_str = ','.join([img['path'] for img in images]) if images else ''
         c.execute("INSERT INTO chats (session_id, timestamp, role, content, images, language) VALUES (?, ?, ?, ?, ?, ?)",
@@ -91,7 +95,7 @@ def save_message(session_id, role, content, images, language):
 
 def get_sessions():
     try:
-        conn = sqlite3.connect('chat_history.db')
+        conn = sqlite3.connect('/tmp/chat_history.db')  # Use /tmp for Streamlit Cloud
         c = conn.cursor()
         c.execute("SELECT DISTINCT session_id, MAX(timestamp) FROM chats GROUP BY session_id ORDER BY timestamp DESC")
         sessions = c.fetchall()
@@ -104,7 +108,7 @@ def get_sessions():
 
 def get_session_messages(session_id):
     try:
-        conn = sqlite3.connect('chat_history.db')
+        conn = sqlite3.connect('/tmp/chat_history.db')  # Use /tmp for Streamlit Cloud
         c = conn.cursor()
         c.execute("SELECT role, content, images, timestamp, language FROM chats WHERE session_id = ? ORDER BY timestamp", (session_id,))
         messages = c.fetchall()
@@ -137,6 +141,7 @@ def clean_latex(text):
             return None
         text = text.replace('\\\\', '\\').strip()
         text = re.sub(r'\${2,}', '$', text)
+        text-Agents: ['Assistant', 'user', 'assistant']
         text = text.strip('$').strip()
         replacements = [
             (r'\s*~\s*([a-zA-Z])', r'\\tilde{\1}'),

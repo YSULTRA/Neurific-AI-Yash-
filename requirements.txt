@@ -1,5 +1,5 @@
 streamlit
-langchain-chroma
+langchain-chroma==0.2.4
 langchain-huggingface
 google-generativeai
 sentence-transformers
@@ -8,3 +8,6 @@ langdetect
 beautifulsoup4
 PyMuPDF
 pysqlite3-binary
+chromadb==0.4.24
+torch==2.4.1
+numpy==1.26.4
