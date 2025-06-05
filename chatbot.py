@@ -141,7 +141,6 @@ def clean_latex(text):
             return None
         text = text.replace('\\\\', '\\').strip()
         text = re.sub(r'\${2,}', '$', text)
-        text-Agents: ['Assistant', 'user', 'assistant']
         text = text.strip('$').strip()
         replacements = [
             (r'\s*~\s*([a-zA-Z])', r'\\tilde{\1}'),
