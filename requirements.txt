@@ -1,0 +1,9 @@
+streamlit
+langchain-chroma
+langchain-huggingface
+google-generativeai
+sentence-transformers
+langchain
+langdetect
+beautifulsoup4
+PyMuPDF
