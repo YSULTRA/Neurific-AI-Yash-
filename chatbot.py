@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Initialize Gemini client
 try:
     genai.configure(api_key="AIzaSyDSdx_r2bsGNxDydqUAxXDeyL795YONMnc")  # Use .env for API key
-    model = genai.GenerativeModel("gemini-1.5-pro")  # Updated to a valid model
+    model = genai.GenerativeModel("gemma-3n-e4b-it")  # Updated to a valid model
 except Exception as e:
     st.error(f"Failed to initialize Gemini: {e}")
     logger.error(f"Gemini initialization error: {e}")
