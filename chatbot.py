@@ -1,3 +1,10 @@
+import sys
+try:
+    __import__("pysqlite3")
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass  # Fallback to system sqlite3 if pysqlite3-binary is not installed
+
 import streamlit as st
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -14,7 +21,6 @@ from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import numpy as np
 import streamlit.web.cli as stcli
-import sys
 
 # Ensure deterministic language detection
 DetectorFactory.seed = 0
