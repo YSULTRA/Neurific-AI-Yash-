@@ -7,3 +7,4 @@ langchain
 langdetect
 beautifulsoup4
 PyMuPDF
+pysqlite3-binary
