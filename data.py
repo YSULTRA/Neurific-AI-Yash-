@@ -1,57 +1,150 @@
-import requests
-from bs4 import BeautifulSoup
-import fitz  # PyMuPDF
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+# Import required libraries
+import sys
+try:
+    # Replace default sqlite3 with pysqlite3 for Streamlit Cloud compatibility
+    __import__("pysqlite3")
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass  # Fallback to system sqlite3 if pysqlite3-binary is unavailable
+
+import streamlit as st
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
-from PIL import Image
-from transformers import pipeline
-import re
+import google.generativeai as genai
 import os
 import logging
-import urllib.parse
-from lxml import etree
-import hashlib
+from datetime import datetime, timedelta
+import time
+import re
+from langchain.schema import Document
+import sqlite3
+from langdetect import detect, DetectorFactory
+from sentence_transformers import SentenceTransformer
+from dotenv import load_dotenv
+import numpy as np
+import torch  # For explicit device control (CPU)
 
-# Set up logging
+# Ensure deterministic language detection
+DetectorFactory.seed = 0
+
+# Load environment variables from .env
+load_dotenv()
+
+# Configure logging for debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize image captioning model (BLIP)
+# Initialize Google Gemini client
 try:
-    captioner = pipeline("image-to-text", model="Salesforce/blip-image-captioning-base", use_fast=True)
+    genai.configure(api_key="AIzaSyDSdx_r2bsGNxDydqUAxXDeyL795YONMnc")
+    model = genai.GenerativeModel("gemma-3-4b-it")  # Use valid Gemini model
 except Exception as e:
-    logger.warning(f"Failed to load BLIP model: {e}. Using placeholder captions.")
-    captioner = None
+    st.error(f"Failed to initialize Gemini: {e}")
+    logger.error(f"Gemini initialization error: {e}")
+    st.stop()
 
-# Global counter for unique chunk IDs
-global_chunk_counter = 0
+# Initialize vector store using existing Chroma DB from data.py
+try:
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={'device': 'cpu'}  # Force CPU to avoid GPU errors
+    )
+    vectorstore = Chroma(
+        collection_name="lstm_rag",
+        embedding_function=embedding_model,
+        persist_directory="/mount/src/neurific-ai-yash-/chroma_db"  # Align with data.py's storage
+    )
+except Exception as e:
+    st.error(f"Failed to initialize vector store: {e}")
+    logger.error(f"Vector store initialization error: {e}")
+    st.stop()
 
-# Validate LaTeX
-def validate_latex(text):
+# Initialize sentence transformer for intent detection
+intent_embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
+
+# Initialize SQLite database for chat history
+def init_db():
     try:
-        if not text or text.strip() in ['=', '', '{}']:
-            return False
-        stripped = text.strip('$').strip()
-        if not re.search(r'\\[a-zA-Z]+|[+\-*/=∑∫∆]', stripped):
-            return False
-        brace_count = 0
-        for char in stripped:
-            if char == '{':
-                brace_count += 1
-            elif char == '}':
-                brace_count -= 1
-            if brace_count < 0:
-                return False
-        return brace_count == 0
+        conn = sqlite3.connect('/tmp/chat_history.db')
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                timestamp TEXT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                images TEXT,
+                language TEXT
+            )
+        ''')
+        conn.commit()
     except Exception as e:
-        logger.error(f"LaTeX validation error: {e}, Input: {text}")
-        return False
+        logger.error(f"Failed to initialize SQLite database: {e}")
+    finally:
+        conn.close()
 
-# Clean LaTeX
+# Save a message to the database
+def save_message(session_id, role, content, images, language):
+    try:
+        conn = sqlite3.connect('/tmp/chat_history.db')
+        c = conn.cursor()
+        images_str = ','.join([img['path'] for img in images]) if images else ''
+        c.execute("INSERT INTO chats (session_id, timestamp, role, content, images, language) VALUES (?, ?, ?, ?, ?, ?)",
+                  (session_id, datetime.now().isoformat(), role, content, images_str, language))
+        conn.commit()
+    except Exception as e:
+        logger.error(f"Error saving message to SQLite: {e}")
+    finally:
+        conn.close()
+
+# Retrieve chat sessions
+def get_sessions():
+    try:
+        conn = sqlite3.connect('/tmp/chat_history.db')
+        c = conn.cursor()
+        c.execute("SELECT DISTINCT session_id, MAX(timestamp) FROM chats GROUP BY session_id ORDER BY timestamp DESC")
+        sessions = c.fetchall()
+        return sessions
+    except Exception as e:
+        logger.error(f"Error retrieving sessions: {e}")
+        return []
+    finally:
+        conn.close()
+
+# Retrieve messages for a session
+def get_session_messages(session_id):
+    try:
+        conn = sqlite3.connect('/tmp/chat_history.db')
+        c = conn.cursor()
+        c.execute("SELECT role, content, images, timestamp, language FROM chats WHERE session_id = ? ORDER BY timestamp", (session_id,))
+        messages = c.fetchall()
+        return messages
+    except Exception as e:
+        logger.error(f"Error retrieving session messages: {e}")
+        return []
+    finally:
+        conn.close()
+
+init_db()
+
+# Rate limiting for Gemini API (30 requests per minute)
+request_times = []
+def rate_limit():
+    global request_times
+    current_time = datetime.now()
+    request_times = [t for t in request_times if t > current_time - timedelta(minutes=1)]
+    if len(request_times) >= 30:
+        wait_time = 60 - (current_time - request_times[0]).seconds
+        logger.warning(f"Rate limit reached. Waiting {wait_time} seconds.")
+        time.sleep(wait_time)
+    request_times.append(current_time)
+
+# Clean LaTeX for rendering
 def clean_latex(text):
     try:
-        if not text or text.strip() in ['=', '', '$$']:
+        if not text or text.strip() in ['=', '', '$$', ' ']:
+            logger.debug(f"Skipping empty or invalid LaTeX content: {text}")
             return None
         text = text.replace('\\\\', '\\').strip()
         text = re.sub(r'\${2,}', '$', text)
@@ -60,378 +153,528 @@ def clean_latex(text):
             (r'\s*~\s*([a-zA-Z])', r'\\tilde{\1}'),
             (r"C'\s*_t", r'\\tilde{C}_t'),
             (r'\[([^\]]+),\s*([^\]]+)\]', r'[\1, \2]'),
+            (r'(\w+)\s*\[\s*([^\]]+)\]', r'\1 \\cdot [\2]'),
             (r'\\begin{cases}(.*?)\\end{cases}', r'\\begin{cases}\1\\end{cases}', re.DOTALL),
-            (r'\\begin{align\*}(.*?)\\end{align\*}', r'\\begin{align*}\1\\end{align*}', re.DOTALL)
+            (r'\\begin{align\*}(.*?)\\end{align\*}', r'\\begin{align*}\1\\end{align*}', re.DOTALL),
+            (r'\\begin{align}(.*?)\\end{align}', r'\\begin{align*}\1\\end{align*}', re.DOTALL)
         ]
         for pattern, repl in replacements:
             text = re.sub(pattern, repl, text)
-        if not validate_latex(text):
+        text = text.replace('cdot', '\\cdot').replace('tanh', '\\tanh').replace('sigma', '\\sigma')
+        if not text or not (text.startswith('\\') or text[0].isalnum() or text[0] in '[{('):
+            logger.debug(f"Invalid LaTeX start: {text}")
             return None
         return f"$${text}$$"
     except Exception as e:
         logger.error(f"Error cleaning LaTeX: {e}, Input: {text}")
         return None
 
-# Generate unique source ID
-def generate_source_id(url):
-    return hashlib.md5(url.encode()).hexdigest()
-
-# Step 1: Data Collection
-def scrape_html(url):
+# Validate LaTeX syntax
+def validate_latex(text):
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        parser = etree.HTMLParser()
-        tree = etree.fromstring(response.content, parser)
-        soup = BeautifulSoup(response.text, 'html.parser')
-
-        # Remove boilerplate
-        for elem in soup.select('nav, footer, .sidebar, .comments'):
-            elem.decompose()
-
-        # Extract text
-        content_area = soup.select_one('article, .post-content, .entry-content, main')
-        text = content_area.get_text(separator=' ', strip=True) if content_area else soup.get_text(separator=' ', strip=True)
-        text = re.sub(r'\s+', ' ', text).strip()
-
-        # Extract LaTeX equations
-        equations = []
-        for script in soup.find_all('script', type='math/tex'):
-            eq = script.text.strip()
-            if validate_latex(eq):
-                equations.append(clean_latex(eq) or eq)
-        for span in soup.find_all('span', class_=['math', 'mjx-chtml']):
-            eq = span.text.strip()
-            if validate_latex(eq):
-                equations.append(clean_latex(eq) or eq)
-        for math in tree.xpath('//math'):
-            try:
-                latex = etree.tostring(math, encoding='unicode')
-                latex = re.sub(r'<[^>]+>', '', latex).strip()
-                if validate_latex(latex):
-                    equations.append(clean_latex(latex) or latex)
-            except Exception as e:
-                logger.warning(f"Failed to process <math> tag: {e}")
-
-        # Extract and save images
-        images = []
-        os.makedirs("./images/html", exist_ok=True)
-        for img in soup.find_all('img'):
-            img_url = img.get('src')
-            if img_url:
-                img_url = urllib.parse.urljoin(url, img_url)
-                try:
-                    img_response = requests.get(img_url, timeout=5)
-                    img_response.raise_for_status()
-                    global global_chunk_counter
-                    img_name = f"{global_chunk_counter}_{os.path.basename(img_url).split('?')[0]}"
-                    img_name = re.sub(r'[^\w\.-]', '_', img_name)
-                    img_path = f"./images/html/{img_name}"
-                    with open(img_path, 'wb') as f:
-                        f.write(img_response.content)
-                    parent = img.find_parent(['p', 'div'])
-                    context_text = parent.get_text(strip=True)[:200] if parent else ""
-                    images.append({
-                        'url': img_url,
-                        'path': img_path,
-                        'context_text': context_text
-                    })
-                    global_chunk_counter += 1
-                except Exception as e:
-                    logger.warning(f"Failed to download image {img_url}: {e}")
-
-        # Advanced section identification
-        sections = []
-        current_section = "Introduction"
-        section_index = 0
-        paragraph_index = 0
-        headings = soup.find_all(['h1', 'h2', 'h3'])
-        content_elements = soup.find_all(['p', 'div'])
-        for tag in headings + content_elements:
-            if tag.name in ['h1', 'h2', 'h3']:
-                current_section = tag.get_text(strip=True)
-                section_index += 1
-                paragraph_index = 0
-            elif tag.name in ['p', 'div'] and tag.get_text(strip=True):
-                paragraph_index += 1
-                sections.append({
-                    'section': current_section,
-                    'content': tag.get_text(strip=True),
-                    'content_type': 'text',
-                    'section_index': section_index,
-                    'paragraph_index': paragraph_index,
-                    'source_id': generate_source_id(url)
-                })
-
-        logger.info(f"Scraped {len(text)} chars, {len(equations)} equations, {len(images)} images from {url}")
-        return text, equations, images, sections
+        if not text:
+            logger.debug("Invalid LaTeX: empty input")
+            return False
+        stripped = text.strip('$').strip()
+        if not stripped or stripped in ['=', '', '{}']:
+            logger.debug(f"Invalid LaTeX: trivial content {text}")
+            return False
+        if not re.search(r'\\[a-zA-Z]+|[+\-*/=∑∫∆]', stripped):
+            logger.debug(f"Invalid LaTeX: no valid commands or operators {text}")
+            return False
+        brace_count = 0
+        for char in stripped:
+            if char == '{':
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+            if brace_count < 0:
+                logger.debug(f"Invalid LaTeX: unbalanced braces {text}")
+                return False
+        if brace_count != 0:
+            logger.debug(f"Invalid LaTeX: unbalanced braces {text}")
+            return False
+        return True
     except Exception as e:
-        logger.error(f"Error scraping {url}: {e}")
-        return "", [], [], []
+        logger.error(f"LaTeX validation error: {e}, Input: {text}")
+        return False
 
-def download_and_extract_pdf(url, output_path="lstm_notes.pdf"):
+# Format equation block for display
+def format_equation_block(equation, description, source, section, page, score, source_id):
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        with open(output_path, 'wb') as f:
-            f.write(response.content)
-
-        doc = fitz.open(output_path)
-        text = ""
-        images = []
-        equations = []
-        os.makedirs("./images/pdf", exist_ok=True)
-
-        for page_num, page in enumerate(doc):
-            page_text = page.get_text("text")
-            text += page_text + "\n"
-
-            for img_index, img in enumerate(page.get_images(full=True)):
-                xref = img[0]
-                base_image = doc.extract_image(xref)
-                if base_image:
-                    image_bytes = base_image["image"]
-                    image_ext = base_image["ext"]
-                    global global_chunk_counter
-                    img_path = f"./images/pdf/page_{page_num}_img_{global_chunk_counter}.{image_ext}"
-                    with open(img_path, 'wb') as f:
-                        f.write(image_bytes)
-                    context_text = page.get_text("text", clip=page.rect)[:200]
-                    images.append({
-                        'url': f"local://{img_path}",
-                        'path': img_path,
-                        'context_text': context_text
-                    })
-                    logger.debug(f"Extracted PDF image: {img_path}")
-                    global_chunk_counter += 1
-
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            if pix:
-                img_path = f"./images/pdf/page_{page_num}_render_{global_chunk_counter}.png"
-                pix.save(img_path)
-                context_text = page.get_text("text", clip=page.rect)[:200]
-                images.append({
-                    'url': f"local://{img_path}",
-                    'path': img_path,
-                    'context_text': context_text
-                })
-                logger.debug(f"Rendered PDF page as image: {img_path}")
-                global_chunk_counter += 1
-
-            page_blocks = page.get_text("dict")["blocks"]
-            for block in page_blocks:
-                if "lines" in block:
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            span_text = span["text"].strip()
-                            if re.search(r'\\[a-zA-Z]+|[∑∫∆]', span_text) and validate_latex(span_text):
-                                cleaned = clean_latex(span_text)
-                                if cleaned:
-                                    equations.append(cleaned)
-
-            sections = []
-            current_section = "Introduction"
-            section_index = 0
-            paragraph_index = 0
-            lines = page_text.split('\n')
-            for line in lines:
-                line = line.strip()
-                if re.match(r'^\d+\.\d+\.?|^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$', line):
-                    current_section = line
-                    section_index += 1
-                    paragraph_index = 0
-                elif line:
-                    paragraph_index += 1
-                    sections.append({
-                        'section': current_section,
-                        'content': line,
-                        'content_type': 'text',
-                        'section_index': section_index,
-                        'paragraph_index': paragraph_index,
-                        'page_number': page_num + 1,
-                        'source_id': generate_source_id(url)
-                    })
-
-        logger.info(f"Extracted {len(text)} chars, {len(equations)} equations, {len(images)} images from {output_path}")
-        return text, equations, images, sections
+        if not validate_latex(equation):
+            return f"**Invalid Equation**: {description}\n**Source**: {source}, **Section**: {section}, **Page**: {page}, **Score**: {score:.4f}\n"
+        return (
+            f"**Equation**:\n{equation}\n"
+            f"**Description**: {description}\n"
+            f"**Source**: {source}, **Section**: {section}, **Page**: {page}, **Similarity Score**: {score:.4f}, **Source ID**: {source_id}\n"
+        )
     except Exception as e:
-        logger.error(f"Error processing PDF {url}: {e}")
-        return "", [], [], []
+        logger.error(f"Error formatting equation: {e}")
+        return f"**Error in Equation**: {description}\n"
 
-# Step 2: Preprocessing
-def convert_latex_to_text(latex):
+# Detect query language
+def detect_language(text):
     try:
-        latex_clean = latex.strip('$')
-        replacements = {
-            r'\\sigma': 'sigmoid',
-            r'\\cdot': 'dot product',
-            r'_{t-1}': ' at time t-1',
-            r'\\frac{([^}]+)}{([^}]+)}': 'fraction \\1 over \\2',
-            r'\\sum': 'summation',
-            r'\\in': 'in',
-            r'\\mathbb{R}': 'real numbers',
-            r'f_t': 'forget gate',
-            r'i_t': 'input gate',
-            r'o_t': 'output gate',
-            r'c_t': 'cell state',
-            r'h_t': 'hidden state'
+        lang = detect(text)
+        logger.info(f"Detected language: {lang} for query: {text}")
+        return lang
+    except Exception as e:
+        logger.error(f"Language detection error: {e}")
+        return 'en'
+
+# Detect query intent (summary, technical, visual, etc.)
+def detect_query_intent(query):
+    try:
+        query_embedding = intent_embedder.encode([query])[0]
+        intents = {
+            'summary': ['what is', 'define', 'explain simply', 'basic', 'overview', 'in simple terms'],
+            'technical': ['how', 'technical', 'equation', 'math', 'details', 'architecture', 'mechanism'],
+            'step_by_step': ['steps', 'process', 'walk through', 'how does', 'procedure', 'step-by-step'],
+            'table': ['table', 'tabular', 'compare', 'advantages', 'disadvantages', 'summary table'],
+            'visual': ['image', 'diagram', 'visual', 'picture', 'figure', 'illustration', 'show images']
         }
-        for pattern, repl in replacements.items():
-            latex_clean = re.sub(pattern, repl, latex_clean)
-        latex_clean = re.sub(r'[\{\}\\]', '', latex_clean)
-        return f"Equation: {latex_clean}"
+        intent_scores = {}
+        for intent, keywords in intents.items():
+            keyword_embeddings = intent_embedder.encode(keywords)
+            scores = [np.dot(query_embedding, ke) / (np.linalg.norm(query_embedding) * np.linalg.norm(ke)) for ke in keyword_embeddings]
+            intent_scores[intent] = max(scores)
+        intent = max(intent_scores, key=intent_scores.get)
+        logger.info(f"Detected intent: {intent} for query: {query}")
+        return intent
     except Exception as e:
-        logger.error(f"Error converting LaTeX: {e}")
-        return f"Equation: {latex}"
+        logger.error(f"Intent detection error: {e}")
+        return 'technical'
 
-def generate_image_caption(img_path, context_text):
+# Check if query is LSTM-related
+def is_lstm_related(query):
+    lstm_keywords = {
+        'lstm', 'lstms', 'long short-term memory', 'long short term memory', 'rnn', 'rnns', 'recurrent neural network',
+        'gate', 'cell', 'state', 'forget', 'input', 'output', 'sigmoid', 'tanh', 'recurrent', 'network', 'neural',
+        'memory', 'architecture', 'diagram', 'sequence', 'dependency', 'gradient', 'vanishing'
+    }
+    query_words = set(re.split(r'\W+', query.lower()))
+    return bool(query_words & lstm_keywords)
+
+# Generate response for user query
+@st.cache_data(ttl=3600)
+def generate_response(query, session_id, lang='en'):
     try:
-        if captioner and os.path.exists(img_path):
-            img = Image.open(img_path)
-            caption = captioner(img)[0]['generated_text']
-            return f"{caption} (Context: {context_text})"
-        return f"Diagram related to LSTMs (Context: {context_text})"
-    except Exception as e:
-        logger.warning(f"Error generating caption for {img_path}: {e}")
-        return f"Diagram related to LSTMs (Context: {context_text})"
+        # Validate query relevance
+        if not is_lstm_related(query):
+            logger.warning(f"Query not related to LSTMs: {query}")
+            return "Sorry, I can only answer questions about Long Short-Term Memory (LSTM) networks or related topics like RNNs based on 'Understanding LSTMs' by Chris Olah and 'CMU LSTM Notes.' Please ask an LSTM-related question.", []
 
-def preprocess_content(text, equations, images, sections, source_name, source_id):
-    global global_chunk_counter
-    try:
-        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-        chunks = []
+        intent_type = detect_query_intent(query)
+        if lang not in ['en', 'hi', 'es', 'fr']:
+            lang = 'en'
+        logger.info(f"Processing query: {query}, intent: {intent_type}, language: {lang}")
 
-        # Process text sections
-        text_chunk_ids = []
-        for section in sections:
-            section_chunks = text_splitter.split_text(section['content'])
-            for chunk in section_chunks:
-                chunk_id = f"{source_id}_text_{global_chunk_counter}"
-                global_chunk_counter += 1
-                text_chunk_ids.append(chunk_id)
-                metadata = {
-                    'source': source_name,
-                    'source_id': source_id,
-                    'section': section['section'],
-                    'content_type': 'text',
-                    'chunk_id': chunk_id,
-                    'section_index': section.get('section_index', 0),
-                    'paragraph_index': section.get('paragraph_index', 0)
-                }
-                if 'page_number' in section:
-                    metadata['page_number'] = section['page_number']
-                chunks.append({
-                    'content': chunk,
-                    'metadata': metadata
-                })
+        # Retrieve relevant chunks from vector store
+        results = vectorstore.similarity_search_with_score(query, k=50)
+        logger.info(f"Retrieved {len(results)} chunks for query: {query}")
+        for doc, score in results[:5]:
+            logger.info(f"Chunk: {doc.page_content[:100]}..., Score: {score}, Metadata: {doc.metadata}")
 
-        # Process equations
-        for i, eq in enumerate(equations):
-            eq_description = convert_latex_to_text(eq)
-            chunk_id = f"{source_id}_equation_{global_chunk_counter}"
-            global_chunk_counter += 1
-            nearest_chunk_id = text_chunk_ids[i % len(text_chunk_ids)] if text_chunk_ids else ""
-            chunks.append({
-                'content': eq_description,
-                'metadata': {
-                    'source': source_name,
-                    'source_id': source_id,
-                    'section': 'Equations',
-                    'content_type': 'equation',
-                    'raw_content': eq,
-                    'chunk_id': chunk_id,
-                    'nearest_text_chunk_id': nearest_chunk_id
-                }
-            })
+        if not results:
+            logger.warning(f"No relevant chunks found for query: {query}")
+            return "No relevant information found in the database. Please try a different LSTM-related question.", []
 
-        # Process images
-        for i, img in enumerate(images):
-            img_description = generate_image_caption(img['path'], img['context_text'])
-            chunk_id = f"{source_id}_image_{global_chunk_counter}"
-            global_chunk_counter += 1
-            nearest_chunk_id = text_chunk_ids[i % len(text_chunk_ids)] if text_chunk_ids else ""
-            tags = ['lstm', 'diagram']
-            if 'gate' in img_description.lower():
-                tags.append('gate')
-            if 'cell' in img_description.lower():
-                tags.append('cell')
-            if 'state' in img_description.lower():
-                tags.append('state')
-            tags_str = ','.join(tags)
-            chunks.append({
-                'content': img_description,
-                'metadata': {
-                    'source': source_name,
-                    'source_id': source_id,
-                    'section': 'Images',
-                    'content_type': 'image',
-                    'raw_content': img['path'],
-                    'chunk_id': chunk_id,
-                    'nearest_text_chunk_id': nearest_chunk_id,
-                    'tags': tags_str
-                }
-            })
+        # Prepare context, images, and references
+        context = []
+        images = []
+        chunk_count = 0
+        total_length = 0
+        max_context_length = 10000
+        source_references = {}
 
-        logger.info(f"Preprocessed {len(chunks)} chunks for {source_name}")
-        return chunks
-    except Exception as e:
-        logger.error(f"Error preprocessing content for {source_name}: {e}")
-        return []
+        query_keywords = set(re.split(r'\W+', query.lower()))
+        relevant_keywords = {'lstm', 'gate', 'cell', 'state', 'forget', 'input', 'output', 'diagram',
+                            'architecture', 'network', 'memory', 'sigmoid', 'tanh', 'flow', 'structure', 'rnn', 'recurrent'}
 
-# Step 3: Embedding and Storing in Vector Database
-def store_in_vector_db(chunks, persist_directory="./chroma_db"):
-    try:
-        embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        vectorstore = Chroma(
-            collection_name="lstm_rag",
-            embedding_function=embedding_model,
-            persist_directory=persist_directory
+        base_path = "/mount/src/neurific-ai-yash-/"  # Streamlit Cloud repository root
+
+        for doc, score in results:
+            content = doc.page_content
+            metadata = doc.metadata
+            source = metadata.get('source', 'Unknown')
+            source_id = metadata.get('source_id', 'Unknown')
+            section = metadata.get('section', 'Unknown')
+            page = metadata.get('page_number', 'N/A')
+            content_type = metadata.get('content_type', 'text')
+
+            ref_key = f"{source}, {section}, Page {page}, Source ID: {source_id}"
+            source_references[ref_key] = source_references.get(ref_key, 0) + 1
+
+            chunk_text = ""
+            if content_type == 'text':
+                chunk_text = f"**Source**: {source}, **Section**: {section}, **Page**: {page}, **Source ID**: {source_id}\n**Content**: {content}\n**Similarity Score**: {score:.4f}"
+            elif content_type == 'equation':
+                raw_latex = metadata.get('raw_content', content)
+                cleaned_latex = clean_latex(raw_latex)
+                if cleaned_latex and validate_latex(cleaned_latex):
+                    chunk_text = format_equation_block(cleaned_latex, content, source, section, page, score, source_id)
+                else:
+                    logger.debug(f"Skipping invalid equation: {raw_latex}")
+                    continue
+            elif content_type == 'image':
+                tags = metadata.get('tags', '').split(',') if metadata.get('tags') else []
+                chunk_text = f"**Source**: {source}, **Section**: {section}, **Page**: {page}, **Source ID**: {source_id}\n**Image Description**: {content}\n**Similarity Score**: {score:.4f}\n**Tags**: {metadata.get('tags', '')}"
+                img_path = metadata.get('raw_content', '')
+                # Resolve image path for Streamlit Cloud
+                img_path = os.path.normpath(os.path.join(base_path, img_path))
+                logger.info(f"Checking image path: {img_path}")
+                if os.path.exists(img_path):
+                    content_keywords = set(content.lower().split())
+                    tag_match = bool(set(tags) & (query_keywords | relevant_keywords))
+                    keyword_match = bool((query_keywords | relevant_keywords) & content_keywords)
+                    if (intent_type == 'visual' or 'diagram' in query.lower() or tag_match or score > 0.2) and (keyword_match or tag_match or score > 0.3):
+                        images.append({
+                            'path': img_path,
+                            'caption': f"Image from {source}, Section: {section}, Page: {page}, Source ID: {source_id} - {content}",
+                            'score': float(score),
+                            'metadata': metadata,
+                            'tags': tags
+                        })
+                        logger.info(f"Selected image: {img_path}, Score: {score:.4f}, Tags: {tags}")
+                    else:
+                        logger.debug(f"Skipped image: {img_path}, Low relevance (Score: {score:.4f})")
+                else:
+                    logger.warning(f"Image path not found: {img_path}")
+
+            if chunk_text and total_length + len(chunk_text) <= max_context_length:
+                context.append(chunk_text)
+                total_length += len(chunk_text)
+                chunk_count += 1
+
+        # Fallback for visual intent
+        if not images and intent_type == 'visual':
+            logger.info("No images found, attempting fallback")
+            for doc, score in results:
+                if doc.metadata.get('content_type') == 'image':
+                    img_path = doc.metadata.get('raw_content', '')
+                    source_id = doc.metadata.get('source_id', 'Unknown')
+                    tags = doc.metadata.get('tags', '').split(',') if doc.metadata.get('tags') else []
+                    img_path = os.path.normpath(os.path.join(base_path, img_path))
+                    if os.path.exists(img_path) and (score > 0.15 or bool(set(tags) & (query_keywords | relevant_keywords))):
+                        images.append({
+                            'path': img_path,
+                            'caption': f"Image from {doc.metadata.get('source', 'Unknown')}, Section: {doc.metadata.get('section', 'Unknown')}, Page: {doc.metadata.get('page_number', 'N/A')}, Source ID: {source_id} - {doc.page_content}",
+                            'score': float(score),
+                            'metadata': doc.metadata,
+                            'tags': tags
+                        })
+                        ref_key = f"{doc.metadata.get('source', 'Unknown')}, {doc.metadata.get('section', 'Unknown')}, Page {doc.metadata.get('page_number', 'N/A')}, Source ID: {source_id}"
+                        source_references[ref_key] = source_references.get(ref_key, 0) + 1
+                        logger.info(f"Fallback image selected: {img_path}, Score: {score:.4f}")
+                        if len(images) >= 3:
+                            break
+
+        logger.info(f"Retrieved {chunk_count} chunks and {len(images)} images for query: {query}")
+
+        # Build chat history context
+        messages = get_session_messages(session_id)
+        history_context = "\n".join([f"{m[0]} ({m[4]}): {m[1]}" for m in messages[-5:]])
+
+        # Construct prompt
+        context_str = '\n\n'.join(context)
+        knowledge_base_summary = (
+            "You are an advanced AI assistant specializing in Long Short-Term Memory (LSTM) networks and Recurrent Neural Networks (RNNs). "
+            "Your knowledge is derived from two primary sources: 'Understanding LSTMs' by Chris Olah (a blog post) and 'CMU LSTM Notes' (Spring 2023, a PDF document). "
+            "These sources cover LSTM architecture, equations, advantages, limitations, and comparisons with RNNs, including diagrams and experimental results. "
+            "You can provide responses in multiple languages (English, Hindi, Spanish, French), render LaTeX equations, and describe relevant images with detailed explanations. "
+            "Your responses are grounded in the provided sources, and you can detect query intent to tailor responses (e.g., summary, technical, step-by-step, tabular, or visual). "
+            "For queries outside the scope of LSTMs or RNNs, you politely redirect users to ask relevant questions. "
+            "When handling visual queries, prioritize images with tags or descriptions matching the query and provide in-depth explanations of their content and relevance."
         )
 
-        texts = [chunk['content'] for chunk in chunks]
-        metadatas = [chunk['metadata'] for chunk in chunks]
-        ids = [chunk['metadata']['chunk_id'] for chunk in chunks]
+        if intent_type == "summary":
+            response_instruction = (
+                f"- Provide a concise summary (100-150 words) in a single paragraph, in {lang}, suitable for beginners.\n"
+                "- Use simple, conversational language and avoid technical jargon.\n"
+                "- Include a brief description of one key image if available, explaining its relevance.\n"
+                "- Render equations in LaTeX within $$ delimiters, using correct syntax.\n"
+                "- If no valid equations, explain the concept in plain text.\n"
+            )
+        elif intent_type == "step_by_step":
+            response_instruction = (
+                f"- Provide a step-by-step explanation in {lang} with numbered steps (1., 2., etc.).\n"
+                "- Use a narrative tone with clear transitions.\n"
+                "- Include relevant equations in LaTeX within $$ delimiters and describe one image if available.\n"
+                "- If no valid equations, use text-based explanations.\n"
+            )
+        elif intent_type == "table":
+            response_instruction = (
+                f"- Provide a tabular explanation in {lang} using markdown table syntax.\n"
+                "- Include columns for relevant categories (e.g., Component, Description, Source, Section, Page).\n"
+                "- Include equations in LaTeX in a separate section if available.\n"
+                "- Describe one image if available.\n"
+            )
+        elif intent_type == "visual":
+            response_instruction = (
+                f"- Provide a detailed explanation in {lang} focusing on visual elements, including at least one relevant diagram.\n"
+                "- For each image, describe:\n"
+                "  - The visual content (e.g., components, labels, flow).\n"
+                "  - How it relates to the query and LSTMs.\n"
+                "  - The source, section, page, and source ID.\n"
+                "- Use bullet points for clarity.\n"
+                "- Include relevant equations in LaTeX within $$ delimiters if applicable.\n"
+                "- If no relevant images are found, explain why and suggest related concepts.\n"
+                "- Cite sources in markdown format.\n"
+            )
+        else:  # technical
+            response_instruction = (
+                f"- Provide a detailed technical explanation in {lang} with sections: Overview, Equations, Explanations, Images.\n"
+                "- Use bullet points for clarity.\n"
+                "- Include all relevant equations in LaTeX within $$ delimiters, using \\begin{align*} for multi-line equations.\n"
+                "- Explain each equation’s variables and role in LSTMs.\n"
+                "- Describe all relevant images with detailed explanations of their content and relevance.\n"
+                "- If no valid equations, provide a detailed text-based explanation.\n"
+                "- Cite sources with sections, pages, and source IDs in markdown format.\n"
+            )
 
-        if len(ids) != len(set(ids)):
-            duplicates = {id for id in ids if ids.count(id) > 1}
-            logger.error(f"Found {len(duplicates)} duplicate IDs: {duplicates}")
-            raise ValueError(f"Duplicate IDs found: {duplicates}")
+        prompt = (
+            f"{knowledge_base_summary}\n\n"
+            f"Answer the query: \"{query}\" in the language {lang}, ensuring the response is clear, accurate, and strictly based on the provided sources.\n\n"
+            f"Recent Chat History:\n{history_context}\n\n"
+            f"Context:\n{context_str}\n\n"
+            f"Instructions:\n{response_instruction}\n"
+            "- Directly quote relevant chunks in markdown blockquotes, citing source, section, page, and source ID.\n"
+            "- If no relevant images are available, state explicitly (e.g., 'No relevant images found') and explain why.\n"
+            "- Use a professional, academic tone unless a summary is requested, then use a conversational tone.\n"
+            "- Ensure all LaTeX equations are formatted within $$ delimiters with correct syntax (e.g., \\tilde{C}_t, \\cdot, \\sigma, \\tanh). Use \\begin{cases} for piecewise equations and \\begin{align*} for multi-line equations.\n"
+            "- Use markdown for clear formatting: ## for sections, - for lists, | for tables, two newlines between sections.\n"
+            "- Include a 'References' section listing unique sources, sections, pages, and source IDs used, without repetition.\n"
+            "- Avoid duplicating references; list each unique source-section-page combination only once.\n"
+        )
 
-        vectorstore.add_texts(texts=texts, metadatas=metadatas, ids=ids)
-        logger.info(f"Stored {len(texts)} chunks in Chroma vector database at {persist_directory}")
-        return vectorstore
+        # Generate response using Gemini
+        rate_limit()
+        response = model.generate_content(prompt)
+        response_text = response.text + "\n\n## References\n" + "\n".join([f"- {k}" for k, v in source_references.items()])
+        logger.info(f"Generated response for query: {query}")
+        return response_text, images
     except Exception as e:
-        logger.error(f"Error storing in vector database: {e}")
-        return None
+        logger.error(f"Error generating response: {e}")
+        return f"Error generating response: {e}", []
 
-# Main Execution
-def main():
-    html_url = "https://colah.github.io/posts/2015-08-Understanding-LSTMs/"
-    pdf_url = "https://deeplearning.cs.cmu.edu/S23/document/readings/LSTM.pdf"
+# Configure Streamlit UI
+st.set_page_config(page_title="Advanced LSTM Chatbot", layout="wide")
+st.title("Advanced LSTM Chatbot")
+st.markdown("Ask questions about LSTMs or RNNs based on *Understanding LSTMs* by Chris Olah and *CMU LSTM Notes* (Spring 2023). Supports multilingual responses, equations, and images. Powered by Google Gemini.")
 
-    os.makedirs("./chroma_db", exist_ok=True)
+# Enhanced MathJax configuration for LaTeX rendering
+st.markdown("""
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <style>
+        .math-equation { margin: 10px 0; text-align: center; }
+        .mjx-chtml { font-size: 120% !important; }
+    </style>
+    <script>
+        window.MathJax = {
+            tex: {
+                inlineMath: [['$', '$'], ['\\(', '\\)']],
+                displayMath: [['$$', '$$'], ['\\[', '\\]']],
+                processEscapes: true,
+                processEnvironments: true,
+                tags: 'ams'
+            },
+            options: {
+                skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre'],
+                ignoreHtmlClass: 'tex2jax_ignore'
+            },
+            startup: {
+                ready: function() {
+                    MathJax.startup.defaultReady();
+                    MathJax.startup.promise.then(() => {
+                        console.log('MathJax is loaded and ready');
+                    });
+                }
+            }
+        };
+        async function renderMathJax() {
+            if (window.MathJax && typeof MathJax.typesetPromise === 'function') {
+                try {
+                    await MathJax.typesetPromise();
+                    console.log('MathJax rendering complete');
+                } catch (e) {
+                    console.error('MathJax rendering error:', e);
+                }
+            }
+        }
+    </script>
+""", unsafe_allow_html=True)
 
-    logger.info("Scraping HTML content...")
-    html_text, html_equations, html_images, html_sections = scrape_html(html_url)
-    html_source_id = generate_source_id(html_url)
+# Language selection in sidebar
+language_options = {
+    'English': 'en',
+    'Hindi': 'hi',
+    'Spanish': 'es',
+    'French': 'fr'
+}
+selected_language = st.sidebar.selectbox("Select Response Language", list(language_options.keys()), index=0)
+preferred_lang = language_options[selected_language]
 
-    logger.info("Downloading and extracting PDF content...")
-    pdf_text, pdf_equations, pdf_images, pdf_sections = download_and_extract_pdf(pdf_url)
-    pdf_source_id = generate_source_id(pdf_url)
+# Session management
+if 'session_id' not in st.session_state:
+    st.session_state.session_id = str(datetime.now().timestamp())
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
 
-    logger.info("Preprocessing content...")
-    html_chunks = preprocess_content(html_text, html_equations, html_images, html_sections, "Understanding LSTMs", html_source_id)
-    pdf_chunks = preprocess_content(pdf_text, pdf_equations, pdf_images, pdf_sections, "CMU LSTM Notes", pdf_source_id)
+# Session selector in sidebar
+sessions = get_sessions()
+session_options = {f"Session {i+1} ({s[1][:19]})": s[0] for i, s in enumerate(sessions)}
+session_options['New Session'] = 'new'
+selected_session = st.sidebar.selectbox("Select Chat Session", list(session_options.keys()))
+if selected_session == 'New Session':
+    st.session_state.session_id = str(datetime.now().timestamp())
+    st.session_state.messages = []
+else:
+    st.session_state.session_id = session_options[selected_session]
+    st.session_state.messages = []
+    for role, content, images_str, _, lang in get_session_messages(st.session_state.session_id):
+        images = [{'path': p, 'caption': 'Image'} for p in images_str.split(',') if p]
+        st.session_state.messages.append({'role': role, 'content': content, 'images': images, 'language': lang})
 
-    all_chunks = html_chunks + pdf_chunks
+# Display chat history
+base_path = "/mount/src/neurific-ai-yash-/"
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(f"**Language**: {message.get('language', 'en')}\n\n{message['content']}", unsafe_allow_html=True)
+        if "images" in message and message["images"]:
+            for img in message["images"]:
+                img_path = os.path.normpath(os.path.join(base_path, img['path']))
+                if os.path.exists(img_path):
+                    st.image(img_path, caption=img.get("caption", "Image"))
+                else:
+                    st.warning(f"Image not found: {img['path']}")
+                    logger.warning(f"Image not found in chat history: {img['path']}")
 
-    logger.info("Storing in vector database...")
-    vectorstore = store_in_vector_db(all_chunks)
-
-    if vectorstore:
-        logger.info("Data collection and storage completed successfully.")
+# Handle user input
+if query := st.chat_input("Ask a question about LSTMs or RNNs"):
+    # Determine response language
+    lang = preferred_lang
+    if re.search(r'\b(in|explain in)\s+(hindi|spanish|french|english)\b', query.lower()):
+        lang_map = {'hindi': 'hi', 'spanish': 'es', 'french': 'fr', 'english': 'en'}
+        for lang_name, lang_code in lang_map.items():
+            if lang_name in query.lower():
+                lang = lang_code
+                break
     else:
-        logger.error("Failed to store data in vector database.")
+        detected_lang = detect_language(query)
+        if detected_lang in language_options.values():
+            lang = detected_lang
 
-if __name__ == "__main__":
-    main()
+    # Save and display user message
+    st.session_state.messages.append({"role": "user", "content": query, "language": lang})
+    save_message(st.session_state.session_id, "user", query, [], lang)
+    with st.chat_message("user"):
+        st.markdown(f"**Language**: {lang}\n\n{query}")
+
+    # Generate and stream response
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            response_container = st.empty()
+            response_text, images = generate_response(query, st.session_state.session_id, lang)
+
+        # Stream response with LaTeX equations
+        streamed_text = ""
+        sections = []
+        current_section = ""
+        equation_blocks = []
+        in_table = False
+
+        lines = response_text.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith('## '):
+                if current_section or equation_blocks:
+                    sections.append((current_section, equation_blocks))
+                    equation_blocks = []
+                current_section = line + '\n\n'
+            elif line.startswith('|'):
+                in_table = True
+                current_section += line + '\n'
+            elif in_table and not line:
+                in_table = False
+                current_section += line + '\n'
+            elif line.startswith('$$') and not line.endswith('$$'):
+                eq_lines = [line[2:]]
+                i += 1
+                while i < len(lines) and not lines[i].strip().endswith('$$'):
+                    eq_lines.append(lines[i].strip())
+                    i += 1
+                if i < len(lines) and lines[i].strip().endswith('$$'):
+                    eq_lines.append(lines[i].strip()[:-2])
+                eq_text = ' '.join(eq_lines).strip()
+                cleaned = clean_latex(eq_text)
+                if cleaned and validate_latex(cleaned):
+                    equation_blocks.append(cleaned.strip('$'))
+                else:
+                    logger.debug(f"Skipping invalid LaTeX: {eq_text}")
+                    current_section += f"$$ {eq_text} $$\n"
+            elif line.startswith('$$') and line.endswith('$$'):
+                cleaned = clean_latex(line.strip('$'))
+                if cleaned and validate_latex(cleaned):
+                    equation_blocks.append(cleaned.strip('$'))
+                else:
+                    logger.debug(f"Skipping invalid LaTeX: {line}")
+                    current_section += line + '\n'
+            else:
+                current_section += line + '\n'
+            i += 1
+        if current_section or equation_blocks:
+            sections.append((current_section, equation_blocks))
+
+        for section, eq_blocks in sections:
+            streamed_text += section
+            response_container.markdown(streamed_text, unsafe_allow_html=True)
+            time.sleep(0.05)
+            for eq in eq_blocks:
+                eq_div = f"\n<div class='math-equation'>$${eq}$$</div>\n"
+                streamed_text += eq_div
+                response_container.markdown(streamed_text, unsafe_allow_html=True)
+                st.markdown("<script>renderMathJax();</script>", unsafe_allow_html=True)
+                time.sleep(0.1)
+
+        # Final MathJax rendering
+        st.markdown("<script>renderMathJax();</script>", unsafe_allow_html=True)
+
+        # Display images with explanations
+        if images:
+            st.subheader("Relevant Images")
+            for img in sorted(images, key=lambda x: x['score'], reverse=True)[:3]:
+                img_path = os.path.normpath(os.path.join(base_path, img['path']))
+                logger.info(f"Attempting to display image: {img_path}")
+                if os.path.exists(img_path):
+                    st.image(img_path, caption=img["caption"])
+                    explanation = (
+                        f"""
+                        **Image Explanation**:\n
+                        - **Content**: This image likely describes {img['metadata'].get('tags', 'LSTM components')}, as described in {img['metadata'].get('source', 'Unknown')}, Section: {img['metadata'].get('section', 'Unknown')}.\n
+                        - **Relevance**: It relates to the query '{query}' by illustrating {', '.join(img['tags']) if img['tags'] else 'LSTM concepts'}.\n
+                        - **Source**: {img['metadata'].get('source', 'Unknown')}, Page: {img['metadata'].get('page_number', 'N/A')}, Source ID: {img['metadata'].get('source_id', 'Unknown')}.\n
+                        """
+                    )
+                    st.markdown(explanation)
+                    logger.info(f"Displayed image: {img_path}, Score: {img['score']:.4f}")
+                else:
+                    st.warning(f"Image not found: {img_path}")
+                    logger.warning(f"Image not found: {img_path}")
+        else:
+            st.info("No relevant images found for this query. Try asking for specific diagrams, e.g., 'show LSTM architecture diagram'.")
+            logger.info("No images found for this query.")
+
+        # Save assistant response
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": response_text,
+            "images": images,
+            "language": lang
+        })
+        save_message(st.session_state.session_id, "assistant", response_text, images, lang)
+
+# Footer
+st.markdown("---")
+st.markdown("<p>Built with Streamlit and Google Gemini. Data sourced from *Understanding LSTMs* by Chris Olah and *CMU LSTM Notes* (Spring 2023).</p>", unsafe_allow_html=True)
