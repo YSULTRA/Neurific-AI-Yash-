@@ -20,7 +20,6 @@ from langdetect import detect, DetectorFactory
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import numpy as np
-import streamlit.web.cli as stcli
 import torch  # Explicitly import torch for device control
 
 # Ensure deterministic language detection
@@ -36,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Initialize Gemini client
 try:
     genai.configure(api_key="AIzaSyDSdx_r2bsGNxDydqUAxXDeyL795YONMnc")  # Use .env for API key
-    model = genai.GenerativeModel("gemma-3n-e4b-it")
+    model = genai.GenerativeModel("gemini-1.5-pro")  # Updated to a valid model
 except Exception as e:
     st.error(f"Failed to initialize Gemini: {e}")
     logger.error(f"Gemini initialization error: {e}")
@@ -57,6 +56,53 @@ except Exception as e:
     st.error(f"Failed to initialize vector store: {e}")
     logger.error(f"Vector store initialization error: {e}")
     st.stop()
+
+# Populate vector store with sample data
+def populate_vectorstore():
+    try:
+        # Check if collection is empty
+        collection = vectorstore._client.get_collection("lstm_rag")
+        if collection.count() > 0:
+            logger.info("Vector store already populated")
+            return
+
+        # Sample data from Understanding LSTMs and CMU LSTM Notes
+        documents = [
+            Document(
+                page_content="LSTM (Long Short-Term Memory) is a type of RNN designed to model long-term dependencies. It addresses the vanishing gradient problem in standard RNNs by introducing gates: forget, input, and output.",
+                metadata={"source": "Understanding LSTMs", "section": "Introduction", "page_number": 1, "content_type": "text", "source_id": "olah_1"}
+            ),
+            Document(
+                page_content="The LSTM architecture includes a cell state and three gates: forget gate, input gate, and output gate. The forget gate decides what information to discard from the cell state.",
+                metadata={"source": "CMU LSTM Notes", "section": "Architecture", "page_number": 5, "content_type": "text", "source_id": "cmu_5"}
+            ),
+            Document(
+                page_content="f_t = \sigma(W_f \cdot [h_{t-1}, x_t] + b_f)",
+                metadata={"source": "CMU LSTM Notes", "section": "Equations", "page_number": 6, "content_type": "equation", "raw_content": "f_t = \\sigma(W_f \\cdot [h_{t-1}, x_t] + b_f)", "source_id": "cmu_6"}
+            ),
+            Document(
+                page_content="Diagram of LSTM cell showing forget, input, and output gates with cell state flow.",
+                metadata={
+                    "source": "Understanding LSTMs",
+                    "section": "Diagram",
+                    "page_number": 3,
+                    "content_type": "image",
+                    "raw_content": "/mount/src/neurific-ai-yash-/images/lstm_diagram.png",
+                    "tags": "lstm, diagram, architecture, gates",
+                    "source_id": "olah_3"
+                }
+            )
+        ]
+
+        # Add documents to vector store
+        vectorstore.add_documents(documents)
+        logger.info("Populated vector store with sample data")
+    except Exception as e:
+        logger.error(f"Error populating vector store: {e}")
+        st.error(f"Failed to populate vector store: {e}")
+
+# Call populate_vectorstore after initialization
+populate_vectorstore()
 
 # Initialize sentence transformer
 intent_embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')  # Explicitly set device to CPU
@@ -263,8 +309,12 @@ def generate_response(query, session_id, lang='en'):
             lang = 'en'
         logger.info(f"Processing query: {query}, intent: {intent_type}, language: {lang}")
 
-        # Retrieve chunks (increased k for more image candidates)
+        # Retrieve chunks
         results = vectorstore.similarity_search_with_score(query, k=50)
+        logger.info(f"Retrieved {len(results)} chunks for query: {query}")
+        for doc, score in results[:5]:  # Log top 5 results
+            logger.info(f"Chunk: {doc.page_content[:100]}..., Score: {score}, Metadata: {doc.metadata}")
+
         if not results:
             logger.warning(f"No relevant chunks found for query: {query}")
             return "No relevant information found in the database. Please try a different LSTM-related question.", []
@@ -281,7 +331,6 @@ def generate_response(query, session_id, lang='en'):
         relevant_keywords = {'lstm', 'gate', 'cell', 'state', 'forget', 'input', 'output', 'diagram',
                             'architecture', 'network', 'memory', 'sigmoid', 'tanh', 'flow', 'structure', 'rnn', 'recurrent'}
 
-        # Relaxed image selection logic
         for doc, score in results:
             content = doc.page_content
             metadata = doc.metadata
@@ -314,7 +363,6 @@ def generate_response(query, session_id, lang='en'):
                     content_keywords = set(content.lower().split())
                     tag_match = bool(set(tags) & (query_keywords | relevant_keywords))
                     keyword_match = bool((query_keywords | relevant_keywords) & content_keywords)
-                    # Lowered score threshold and relaxed conditions for visual intent
                     if (intent_type == 'visual' or 'diagram' in query.lower() or tag_match or score > 0.2) and (keyword_match or tag_match or score > 0.3):
                         images.append({
                             'path': img_path,
@@ -621,10 +669,12 @@ if query := st.chat_input("Ask a question about LSTMs or RNNs"):
                 if os.path.exists(img["path"]):
                     st.image(img["path"], caption=img["caption"])
                     explanation = (
-                        f"**Image Explanation**:\n"
-                        f"- **Content**: This image likely depicts {img['metadata'].get('tags', 'LSTM components')}, as described in {img['metadata'].get('source', 'Unknown')}, Section: {img['metadata'].get('section', 'Unknown')}.\n"
-                        f"- **Relevance**: It relates to the query '{query}' by illustrating {', '.join(img['tags']) if img['tags'] else 'LSTM concepts'}.\n"
-                        f"- **Source Details**: {img['metadata'].get('source', 'Unknown')}, Page: {img['metadata'].get('page_number', 'N/A')}, Source ID: {img['metadata'].get('source_id', 'Unknown')}."
+                        f"""
+                        **Image Explanation**:\n
+                        - **Content**: This image likely describes {img['metadata'].get('tags', 'LSTM components')}, as described in {img['metadata'].get('source', 'Unknown')}}, Section: {img['metadata'].get('section', 'Unknown')}.\n
+                        - **Relevance**: It relates to the query '{query}' by illustrating {', '.join(img['tags']) if img['tags'] else 'LSTM concepts'}.\n
+                        - **Source**: {img['metadata'].get('source', 'Unknown')}}, Page: {img['metadata'].get('page_number', 'N/A')}}, Source ID: {img['metadata'].get('source_id', 'Unknown')}.\n
+                        """
                     )
                     st.markdown(explanation)
                     logger.info(f"Displayed image: {img['path']}, Score: {img['score']:.4f}")
@@ -633,7 +683,7 @@ if query := st.chat_input("Ask a question about LSTMs or RNNs"):
                     logger.warning(f"Image not found: {img['path']}")
         else:
             st.info("No relevant images found for this query. Try asking for specific diagrams, e.g., 'show LSTM architecture diagram'.")
-            logger.info("No relevant images found for this query.")
+            logger.info("No images found for this query.")
 
         # Save response
         st.session_state.messages.append({
@@ -646,4 +696,4 @@ if query := st.chat_input("Ask a question about LSTMs or RNNs"):
 
 # Footer
 st.markdown("---")
-st.markdown("Built with Streamlit and Google Gemini. Data sourced from *Understanding LSTMs* by Chris Olah and *CMU LSTM Notes* (Spring 2023).")
+st.markdown("<p>Built with Streamlit and Google Gemini. Data sourced from *Understanding LSTMs* by Chris Olah and *CMU LSTM Notes* (Spring 2023).</p>", unsafe_allow_html=True)
