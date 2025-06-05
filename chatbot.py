@@ -1,9 +1,11 @@
+# Import required libraries
 import sys
 try:
+    # Replace default sqlite3 with pysqlite3 for Streamlit Cloud compatibility
     __import__("pysqlite3")
     sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
 except ImportError:
-    pass  # Fallback to system sqlite3 if pysqlite3-binary is not installed
+    pass  # Fallback to system sqlite3 if pysqlite3-binary is unavailable
 
 import streamlit as st
 from langchain_chroma import Chroma
@@ -20,115 +22,72 @@ from langdetect import detect, DetectorFactory
 from sentence_transformers import SentenceTransformer
 from dotenv import load_dotenv
 import numpy as np
-import torch  # Explicitly import torch for device control
+import torch  # For explicit device control (CPU)
 
 # Ensure deterministic language detection
 DetectorFactory.seed = 0
 
-# Load environment variables
+# Load environment variables from .env
 load_dotenv()
 
-# Set up logging
+# Configure logging for debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Initialize Gemini client
+# Initialize Google Gemini client
 try:
-    genai.configure(api_key="AIzaSyDSdx_r2bsGNxDydqUAxXDeyL795YONMnc")  # Use .env for API key
-    model = genai.GenerativeModel("gemma-3n-e4b-it")  # Updated to a valid model
+    genai.configure(api_key="AIzaSyDSdx_r2bsGNxDydqUAxXDeyL795YONMnc")
+    model = genai.GenerativeModel("gemma-3-4b-it")  # Use valid Gemini model
 except Exception as e:
     st.error(f"Failed to initialize Gemini: {e}")
     logger.error(f"Gemini initialization error: {e}")
     st.stop()
 
-# Initialize vector store
+# Initialize vector store using existing Chroma DB from data.py
 try:
     embedding_model = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={'device': 'cpu'}  # Explicitly set device to CPU
+        model_kwargs={'device': 'cpu'}  # Force CPU to avoid GPU errors
     )
     vectorstore = Chroma(
         collection_name="lstm_rag",
         embedding_function=embedding_model,
-        persist_directory="/tmp/chroma_db"  # Use /tmp for Streamlit Cloud
+        persist_directory="/mount/src/neurific-ai-yash-/chroma_db"  # Align with data.py's storage
     )
 except Exception as e:
     st.error(f"Failed to initialize vector store: {e}")
     logger.error(f"Vector store initialization error: {e}")
     st.stop()
 
-# Populate vector store with sample data
-def populate_vectorstore():
-    try:
-        # Check if collection is empty
-        collection = vectorstore._client.get_collection("lstm_rag")
-        if collection.count() > 0:
-            logger.info("Vector store already populated")
-            return
+# Initialize sentence transformer for intent detection
+intent_embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')
 
-        # Sample data from Understanding LSTMs and CMU LSTM Notes
-        documents = [
-            Document(
-                page_content="LSTM (Long Short-Term Memory) is a type of RNN designed to model long-term dependencies. It addresses the vanishing gradient problem in standard RNNs by introducing gates: forget, input, and output.",
-                metadata={"source": "Understanding LSTMs", "section": "Introduction", "page_number": 1, "content_type": "text", "source_id": "olah_1"}
-            ),
-            Document(
-                page_content="The LSTM architecture includes a cell state and three gates: forget gate, input gate, and output gate. The forget gate decides what information to discard from the cell state.",
-                metadata={"source": "CMU LSTM Notes", "section": "Architecture", "page_number": 5, "content_type": "text", "source_id": "cmu_5"}
-            ),
-            Document(
-                page_content="f_t = \sigma(W_f \cdot [h_{t-1}, x_t] + b_f)",
-                metadata={"source": "CMU LSTM Notes", "section": "Equations", "page_number": 6, "content_type": "equation", "raw_content": "f_t = \\sigma(W_f \\cdot [h_{t-1}, x_t] + b_f)", "source_id": "cmu_6"}
-            ),
-            Document(
-                page_content="Diagram of LSTM cell showing forget, input, and output gates with cell state flow.",
-                metadata={
-                    "source": "Understanding LSTMs",
-                    "section": "Diagram",
-                    "page_number": 3,
-                    "content_type": "image",
-                    "raw_content": "/mount/src/neurific-ai-yash-/images/lstm_diagram.png",
-                    "tags": "lstm, diagram, architecture, gates",
-                    "source_id": "olah_3"
-                }
-            )
-        ]
-
-        # Add documents to vector store
-        vectorstore.add_documents(documents)
-        logger.info("Populated vector store with sample data")
-    except Exception as e:
-        logger.error(f"Error populating vector store: {e}")
-        st.error(f"Failed to populate vector store: {e}")
-
-# Call populate_vectorstore after initialization
-populate_vectorstore()
-
-# Initialize sentence transformer
-intent_embedder = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')  # Explicitly set device to CPU
-
-# SQLite for chat history
+# Initialize SQLite database for chat history
 def init_db():
     try:
-        conn = sqlite3.connect('/tmp/chat_history.db')  # Use /tmp for Streamlit Cloud
+        conn = sqlite3.connect('/tmp/chat_history.db')
         c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS chats
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                      session_id TEXT,
-                      timestamp TEXT,
-                      role TEXT NOT NULL,
-                      content TEXT NOT NULL,
-                      images TEXT,
-                      language TEXT)''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS chats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT,
+                timestamp TEXT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                images TEXT,
+                language TEXT
+            )
+        ''')
         conn.commit()
     except Exception as e:
         logger.error(f"Failed to initialize SQLite database: {e}")
     finally:
         conn.close()
 
+# Save a message to the database
 def save_message(session_id, role, content, images, language):
     try:
-        conn = sqlite3.connect('/tmp/chat_history.db')  # Use /tmp for Streamlit Cloud
+        conn = sqlite3.connect('/tmp/chat_history.db')
         c = conn.cursor()
         images_str = ','.join([img['path'] for img in images]) if images else ''
         c.execute("INSERT INTO chats (session_id, timestamp, role, content, images, language) VALUES (?, ?, ?, ?, ?, ?)",
@@ -139,9 +98,10 @@ def save_message(session_id, role, content, images, language):
     finally:
         conn.close()
 
+# Retrieve chat sessions
 def get_sessions():
     try:
-        conn = sqlite3.connect('/tmp/chat_history.db')  # Use /tmp for Streamlit Cloud
+        conn = sqlite3.connect('/tmp/chat_history.db')
         c = conn.cursor()
         c.execute("SELECT DISTINCT session_id, MAX(timestamp) FROM chats GROUP BY session_id ORDER BY timestamp DESC")
         sessions = c.fetchall()
@@ -152,9 +112,10 @@ def get_sessions():
     finally:
         conn.close()
 
+# Retrieve messages for a session
 def get_session_messages(session_id):
     try:
-        conn = sqlite3.connect('/tmp/chat_history.db')  # Use /tmp for Streamlit Cloud
+        conn = sqlite3.connect('/tmp/chat_history.db')
         c = conn.cursor()
         c.execute("SELECT role, content, images, timestamp, language FROM chats WHERE session_id = ? ORDER BY timestamp", (session_id,))
         messages = c.fetchall()
@@ -167,7 +128,7 @@ def get_session_messages(session_id):
 
 init_db()
 
-# Rate limiting for Gemini (30 RPM)
+# Rate limiting for Gemini API (30 requests per minute)
 request_times = []
 def rate_limit():
     global request_times
@@ -179,7 +140,7 @@ def rate_limit():
         time.sleep(wait_time)
     request_times.append(current_time)
 
-# Clean LaTeX
+# Clean LaTeX for rendering
 def clean_latex(text):
     try:
         if not text or text.strip() in ['=', '', '$$', ' ']:
@@ -208,7 +169,7 @@ def clean_latex(text):
         logger.error(f"Error cleaning LaTeX: {e}, Input: {text}")
         return None
 
-# Validate LaTeX
+# Validate LaTeX syntax
 def validate_latex(text):
     try:
         if not text:
@@ -238,7 +199,7 @@ def validate_latex(text):
         logger.error(f"LaTeX validation error: {e}, Input: {text}")
         return False
 
-# Format equation block
+# Format equation block for display
 def format_equation_block(equation, description, source, section, page, score, source_id):
     try:
         if not validate_latex(equation):
@@ -252,7 +213,7 @@ def format_equation_block(equation, description, source, section, page, score, s
         logger.error(f"Error formatting equation: {e}")
         return f"**Error in Equation**: {description}\n"
 
-# Detect language
+# Detect query language
 def detect_language(text):
     try:
         lang = detect(text)
@@ -262,7 +223,7 @@ def detect_language(text):
         logger.error(f"Language detection error: {e}")
         return 'en'
 
-# Detect query intent
+# Detect query intent (summary, technical, visual, etc.)
 def detect_query_intent(query):
     try:
         query_embedding = intent_embedder.encode([query])[0]
@@ -295,11 +256,11 @@ def is_lstm_related(query):
     query_words = set(re.split(r'\W+', query.lower()))
     return bool(query_words & lstm_keywords)
 
-# Generate response
+# Generate response for user query
 @st.cache_data(ttl=3600)
 def generate_response(query, session_id, lang='en'):
     try:
-        # Check if query is LSTM-related
+        # Validate query relevance
         if not is_lstm_related(query):
             logger.warning(f"Query not related to LSTMs: {query}")
             return "Sorry, I can only answer questions about Long Short-Term Memory (LSTM) networks or related topics like RNNs based on 'Understanding LSTMs' by Chris Olah and 'CMU LSTM Notes.' Please ask an LSTM-related question.", []
@@ -309,10 +270,10 @@ def generate_response(query, session_id, lang='en'):
             lang = 'en'
         logger.info(f"Processing query: {query}, intent: {intent_type}, language: {lang}")
 
-        # Retrieve chunks
+        # Retrieve relevant chunks from vector store
         results = vectorstore.similarity_search_with_score(query, k=50)
         logger.info(f"Retrieved {len(results)} chunks for query: {query}")
-        for doc, score in results[:5]:  # Log top 5 results
+        for doc, score in results[:5]:
             logger.info(f"Chunk: {doc.page_content[:100]}..., Score: {score}, Metadata: {doc.metadata}")
 
         if not results:
@@ -330,6 +291,8 @@ def generate_response(query, session_id, lang='en'):
         query_keywords = set(re.split(r'\W+', query.lower()))
         relevant_keywords = {'lstm', 'gate', 'cell', 'state', 'forget', 'input', 'output', 'diagram',
                             'architecture', 'network', 'memory', 'sigmoid', 'tanh', 'flow', 'structure', 'rnn', 'recurrent'}
+
+        base_path = "/mount/src/neurific-ai-yash-/"  # Streamlit Cloud repository root
 
         for doc, score in results:
             content = doc.page_content
@@ -358,7 +321,9 @@ def generate_response(query, session_id, lang='en'):
                 tags = metadata.get('tags', '').split(',') if metadata.get('tags') else []
                 chunk_text = f"**Source**: {source}, **Section**: {section}, **Page**: {page}, **Source ID**: {source_id}\n**Image Description**: {content}\n**Similarity Score**: {score:.4f}\n**Tags**: {metadata.get('tags', '')}"
                 img_path = metadata.get('raw_content', '')
-                img_path = os.path.normpath(os.path.abspath(img_path))
+                # Resolve image path for Streamlit Cloud
+                img_path = os.path.normpath(os.path.join(base_path, img_path))
+                logger.info(f"Checking image path: {img_path}")
                 if os.path.exists(img_path):
                     content_keywords = set(content.lower().split())
                     tag_match = bool(set(tags) & (query_keywords | relevant_keywords))
@@ -384,11 +349,13 @@ def generate_response(query, session_id, lang='en'):
 
         # Fallback for visual intent
         if not images and intent_type == 'visual':
+            logger.info("No images found, attempting fallback")
             for doc, score in results:
                 if doc.metadata.get('content_type') == 'image':
                     img_path = doc.metadata.get('raw_content', '')
                     source_id = doc.metadata.get('source_id', 'Unknown')
                     tags = doc.metadata.get('tags', '').split(',') if doc.metadata.get('tags') else []
+                    img_path = os.path.normpath(os.path.join(base_path, img_path))
                     if os.path.exists(img_path) and (score > 0.15 or bool(set(tags) & (query_keywords | relevant_keywords))):
                         images.append({
                             'path': img_path,
@@ -405,11 +372,11 @@ def generate_response(query, session_id, lang='en'):
 
         logger.info(f"Retrieved {chunk_count} chunks and {len(images)} images for query: {query}")
 
-        # Chat history context
+        # Build chat history context
         messages = get_session_messages(session_id)
         history_context = "\n".join([f"{m[0]} ({m[4]}): {m[1]}" for m in messages[-5:]])
 
-        # Prompt
+        # Construct prompt
         context_str = '\n\n'.join(context)
         knowledge_base_summary = (
             "You are an advanced AI assistant specializing in Long Short-Term Memory (LSTM) networks and Recurrent Neural Networks (RNNs). "
@@ -481,7 +448,7 @@ def generate_response(query, session_id, lang='en'):
             "- Avoid duplicating references; list each unique source-section-page combination only once.\n"
         )
 
-        # Generate response
+        # Generate response using Gemini
         rate_limit()
         response = model.generate_content(prompt)
         response_text = response.text + "\n\n## References\n" + "\n".join([f"- {k}" for k, v in source_references.items()])
@@ -491,21 +458,26 @@ def generate_response(query, session_id, lang='en'):
         logger.error(f"Error generating response: {e}")
         return f"Error generating response: {e}", []
 
-# Streamlit UI
+# Configure Streamlit UI
 st.set_page_config(page_title="Advanced LSTM Chatbot", layout="wide")
 st.title("Advanced LSTM Chatbot")
 st.markdown("Ask questions about LSTMs or RNNs based on *Understanding LSTMs* by Chris Olah and *CMU LSTM Notes* (Spring 2023). Supports multilingual responses, equations, and images. Powered by Google Gemini.")
 
-# Add MathJax 3 with explicit rendering
+# Enhanced MathJax configuration for LaTeX rendering
 st.markdown("""
     <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+    <style>
+        .math-equation { margin: 10px 0; text-align: center; }
+        .mjx-chtml { font-size: 120% !important; }
+    </style>
     <script>
         window.MathJax = {
             tex: {
                 inlineMath: [['$', '$'], ['\\(', '\\)']],
                 displayMath: [['$$', '$$'], ['\\[', '\\]']],
                 processEscapes: true,
-                processEnvironments: true
+                processEnvironments: true,
+                tags: 'ams'
             },
             options: {
                 skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre'],
@@ -522,13 +494,18 @@ st.markdown("""
         };
         async function renderMathJax() {
             if (window.MathJax && typeof MathJax.typesetPromise === 'function') {
-                await MathJax.typesetPromise();
+                try {
+                    await MathJax.typesetPromise();
+                    console.log('MathJax rendering complete');
+                } catch (e) {
+                    console.error('MathJax rendering error:', e);
+                }
             }
         }
     </script>
 """, unsafe_allow_html=True)
 
-# Language selection
+# Language selection in sidebar
 language_options = {
     'English': 'en',
     'Hindi': 'hi',
@@ -544,7 +521,7 @@ if 'session_id' not in st.session_state:
 if 'messages' not in st.session_state:
     st.session_state.messages = []
 
-# Session selector
+# Session selector in sidebar
 sessions = get_sessions()
 session_options = {f"Session {i+1} ({s[1][:19]})": s[0] for i, s in enumerate(sessions)}
 session_options['New Session'] = 'new'
@@ -560,20 +537,22 @@ else:
         st.session_state.messages.append({'role': role, 'content': content, 'images': images, 'language': lang})
 
 # Display chat history
+base_path = "/mount/src/neurific-ai-yash-/"
 for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(f"**Language**: {message.get('language', 'en')}\n\n{message['content']}", unsafe_allow_html=True)
         if "images" in message and message["images"]:
             for img in message["images"]:
-                if os.path.exists(img["path"]):
-                    st.image(img["path"], caption=img.get("caption", "Image"))
+                img_path = os.path.normpath(os.path.join(base_path, img['path']))
+                if os.path.exists(img_path):
+                    st.image(img_path, caption=img.get("caption", "Image"))
                 else:
                     st.warning(f"Image not found: {img['path']}")
                     logger.warning(f"Image not found in chat history: {img['path']}")
 
-# User input
+# Handle user input
 if query := st.chat_input("Ask a question about LSTMs or RNNs"):
-    # Use user-selected language
+    # Determine response language
     lang = preferred_lang
     if re.search(r'\b(in|explain in)\s+(hindi|spanish|french|english)\b', query.lower()):
         lang_map = {'hindi': 'hi', 'spanish': 'es', 'french': 'fr', 'english': 'en'}
@@ -586,7 +565,7 @@ if query := st.chat_input("Ask a question about LSTMs or RNNs"):
         if detected_lang in language_options.values():
             lang = detected_lang
 
-    # Add user message
+    # Save and display user message
     st.session_state.messages.append({"role": "user", "content": query, "language": lang})
     save_message(st.session_state.session_id, "user", query, [], lang)
     with st.chat_message("user"):
@@ -598,7 +577,7 @@ if query := st.chat_input("Ask a question about LSTMs or RNNs"):
             response_container = st.empty()
             response_text, images = generate_response(query, st.session_state.session_id, lang)
 
-        # Stream response
+        # Stream response with LaTeX equations
         streamed_text = ""
         sections = []
         current_section = ""
@@ -666,8 +645,10 @@ if query := st.chat_input("Ask a question about LSTMs or RNNs"):
         if images:
             st.subheader("Relevant Images")
             for img in sorted(images, key=lambda x: x['score'], reverse=True)[:3]:
-                if os.path.exists(img["path"]):
-                    st.image(img["path"], caption=img["caption"])
+                img_path = os.path.normpath(os.path.join(base_path, img['path']))
+                logger.info(f"Attempting to display image: {img_path}")
+                if os.path.exists(img_path):
+                    st.image(img_path, caption=img["caption"])
                     explanation = (
                         f"""
                         **Image Explanation**:\n
@@ -677,15 +658,15 @@ if query := st.chat_input("Ask a question about LSTMs or RNNs"):
                         """
                     )
                     st.markdown(explanation)
-                    logger.info(f"Displayed image: {img['path']}, Score: {img['score']:.4f}")
+                    logger.info(f"Displayed image: {img_path}, Score: {img['score']:.4f}")
                 else:
-                    st.warning(f"Image not found: {img['path']}")
-                    logger.warning(f"Image not found: {img['path']}")
+                    st.warning(f"Image not found: {img_path}")
+                    logger.warning(f"Image not found: {img_path}")
         else:
             st.info("No relevant images found for this query. Try asking for specific diagrams, e.g., 'show LSTM architecture diagram'.")
             logger.info("No images found for this query.")
 
-        # Save response
+        # Save assistant response
         st.session_state.messages.append({
             "role": "assistant",
             "content": response_text,
