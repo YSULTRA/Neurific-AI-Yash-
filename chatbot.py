@@ -671,9 +671,9 @@ if query := st.chat_input("Ask a question about LSTMs or RNNs"):
                     explanation = (
                         f"""
                         **Image Explanation**:\n
-                        - **Content**: This image likely describes {img['metadata'].get('tags', 'LSTM components')}, as described in {img['metadata'].get('source', 'Unknown')}}, Section: {img['metadata'].get('section', 'Unknown')}.\n
+                        - **Content**: This image likely describes {img['metadata'].get('tags', 'LSTM components')}, as described in {img['metadata'].get('source', 'Unknown')}, Section: {img['metadata'].get('section', 'Unknown')}.\n
                         - **Relevance**: It relates to the query '{query}' by illustrating {', '.join(img['tags']) if img['tags'] else 'LSTM concepts'}.\n
-                        - **Source**: {img['metadata'].get('source', 'Unknown')}}, Page: {img['metadata'].get('page_number', 'N/A')}}, Source ID: {img['metadata'].get('source_id', 'Unknown')}.\n
+                        - **Source**: {img['metadata'].get('source', 'Unknown')}, Page: {img['metadata'].get('page_number', 'N/A')}, Source ID: {img['metadata'].get('source_id', 'Unknown')}.\n
                         """
                     )
                     st.markdown(explanation)
